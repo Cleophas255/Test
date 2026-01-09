@@ -1,0 +1,110 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from ecdsa import SigningKey, SECP256k1
+import hashlib
+import base58
+
+# ---------- CONFIG ----------
+IMAGE_PATH = "cryptoHALV.png"
+WHITE_THRESHOLD = 200   # pixel brightness
+MIN_BAR_HEIGHT = 5      # ignore noise
+# ----------------------------
+
+# ---------- LOAD IMAGE ----------
+img = cv2.imread(IMAGE_PATH, cv2.IMREAD_GRAYSCALE)
+if img is None:
+    raise RuntimeError("Image not found")
+
+h, w = img.shape
+print(f"Image size: {w} x {h}")
+
+# ---------- BINARIZE ----------
+_, bw = cv2.threshold(img, WHITE_THRESHOLD, 255, cv2.THRESH_BINARY)
+
+# ---------- MEASURE VERTICAL BAR HEIGHTS ----------
+heights = []
+
+for x in range(w):
+    ys = np.where(bw[:, x] == 255)[0]
+    if len(ys) == 0:
+        heights.append(0)
+        continue
+    bar_height = ys[-1] - ys[0]
+    heights.append(bar_height if bar_height >= MIN_BAR_HEIGHT else 0)
+
+heights = np.array(heights)
+
+# Trim empty columns
+valid = heights > 0
+x_vals = np.where(valid)[0]
+h_vals = heights[valid]
+
+print(f"Detected bars: {len(h_vals)}")
+
+# ---------- FIT EXPONENTIAL DECAY ----------
+# Model: H(x) = A * exp(-k*x)
+log_h = np.log(h_vals)
+coeffs = np.polyfit(x_vals, log_h, 1)
+k = -coeffs[0]
+A = np.exp(coeffs[1])
+
+print(f"Estimated decay k = {k:.6f}")
+
+# ---------- REVERSE HALVING ----------
+norm_heights = heights * np.exp(k * np.arange(w))
+
+# ---------- ISOLATE BIT REGION ----------
+# Expect ~256 bars
+# Use only columns with signal
+nz = norm_heights[norm_heights > 0]
+
+if len(nz) < 256:
+    raise RuntimeError("Not enough bars detected")
+
+# Resample to 256 bits
+indices = np.linspace(0, len(nz) - 1, 256).astype(int)
+bits_heights = nz[indices]
+
+# ---------- THRESHOLD ----------
+threshold = (np.max(bits_heights) + np.min(bits_heights)) / 2
+bits = (bits_heights > threshold).astype(int)
+
+# ---------- DISPLAY ----------
+print("First 64 bits:")
+print("".join(map(str, bits[:64])))
+
+# ---------- BINARY → PRIVATE KEY ----------
+bitstring = "".join(map(str, bits))
+privkey_hex = hex(int(bitstring, 2))[2:].zfill(64)
+
+print("\nPrivate key (hex):")
+print(privkey_hex)
+
+# ---------- BITCOIN ADDRESS ----------
+privkey_bytes = bytes.fromhex(privkey_hex)
+sk = SigningKey.from_string(privkey_bytes, curve=SECP256k1)
+vk = sk.verifying_key
+
+pubkey = b'\x04' + vk.to_string()
+sha = hashlib.sha256(pubkey).digest()
+rip = hashlib.new('ripemd160', sha).digest()
+
+payload = b'\x00' + rip
+checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+address = base58.b58encode(payload + checksum).decode()
+
+print("\nBitcoin address:")
+print(address)
+
+# ---------- OPTIONAL PLOTS ----------
+plt.figure(figsize=(12,4))
+plt.title("Raw bar heights")
+plt.plot(heights)
+plt.show()
+
+plt.figure(figsize=(12,4))
+plt.title("Normalized heights (after reverse halving)")
+plt.plot(norm_heights)
+plt.axhline(threshold, color='red')
+plt.show()
